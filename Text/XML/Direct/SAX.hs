@@ -1,5 +1,6 @@
 {-# LANGUAGE GADTs #-}
 module Text.XML.Direct.SAX (
+                            module Data.XML.Types,
                             Parser,
                             newParser,
                             Callback,
@@ -21,6 +22,7 @@ module Text.XML.Direct.SAX (
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.UTF8 as UTF8
+import Data.Char
 import Data.IORef
 import Data.XML.Types
 
@@ -161,11 +163,94 @@ parsedDoctype :: Callback (Doctype -> IO Bool)
 parsedDoctype = CallbackDoctype
 
 
+isNameStartChar :: Char -> Bool
+isNameStartChar c =
+  let codepoint = ord c
+      inRange (a, b) = a <= codepoint && codepoint <= b
+  in isLetter c || c == '_' || any inRange nameStartCharRanges
+
+
+isNameChar :: Char -> Bool
+isNameChar c =
+  let codepoint = ord c
+      inRange (a, b) = a <= codepoint && codepoint <= b
+  in isLetter c
+     || isDigit c
+     || c == '-'
+     || c == '.'
+     || c == (chr 0xB7)
+     || any inRange nameCharRanges
+
+
+nameStartCharRanges :: [(Int, Int)]
+nameStartCharRanges =
+  [(0xC0, 0xD6), (0xD8, 0xF6), (0xF8, 0x2FF), (0x370, 0x37D), (0x37F, 0x1FFF),
+   (0x200C, 0x200D), (0x2070, 0x218F), (0x2C00, 0x2FEF), (0x3001, 0xD7FF),
+   (0xF900, 0xFDCF), (0xFDF0, 0xFFFD), (0x10000, 0xEFFFF)]
+
+
+nameCharRanges :: [(Int, Int)]
+nameCharRanges =
+  nameStartCharRanges
+  ++ [(0x0300, 0x036F), (0x203F, 0x2040)]
+
+
 parseBytes :: Parser -> ByteString -> IO ()
-parseBytes parser bytes = do
-  undefined
+parseBytes parser newBytes = do
+  let loop :: ByteString -> IO ()
+      loop bytes = do
+        case UTF8.uncons bytes of
+          Nothing -> return ()
+          Just (c, bytes') -> do
+            (keepGoing, bytes'')
+              <- case c of
+                   '<' -> handleThing bytes'
+                   _ -> handleText bytes
+            if keepGoing
+              then loop bytes''
+              else writeIORef (parserInputBuffer parser) bytes''
+      
+      handleText :: ByteString -> IO (Bool, ByteString)
+      handleText bytes = do
+        let (text, _) = UTF8.foldl (\(result, done) c ->
+                                      if done
+                                         then (result, True)
+                                         else if c == '<'
+                                                then (result, True)
+                                                else (result ++ [c], False))
+                                   ("", False)
+                                   bytes
+            bytes' = UTF8.drop (length text) bytes
+            callbackIORef = parserCharactersCallback parser
+        maybeCallback <- readIORef callbackIORef
+        keepGoing <- case maybeCallback of
+                       Nothing -> return True
+                       Just callback -> callback text
+        return (keepGoing, bytes')
+      
+      handleThing :: ByteString -> IO (Bool, ByteString)
+      handleThing bytes = do
+        let (thing, _) = UTF8.foldl (\(result, done) c ->
+                                       if done
+                                          then (result, True)
+                                          else if c == '>'
+                                                 then (result ++ [c], True)
+                                                 else (result ++ [c], False))
+                                    ("", False)
+                                    bytes
+            complete = last thing == '>'
+            bytes' = if complete
+                       then UTF8.drop (length thing) bytes
+                       else bytes
+        return (complete, bytes')
+  
+  preexistingBytes <- readIORef $ parserInputBuffer parser
+  loop $ BS.concat [preexistingBytes, newBytes]
 
 
 parseComplete :: Parser -> IO ()
 parseComplete parser = do
-  undefined
+  preexistingBytes <- readIORef $ parserInputBuffer parser
+  if not $ BS.null preexistingBytes
+    then parserErrorHandler parser $ "Trailing garbage at end of XML."
+    else return ()
